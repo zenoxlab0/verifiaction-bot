@@ -42,7 +42,7 @@ class BackupView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     
-    @discord.ui.button(label="✓ Verify Account", style=discord.ButtonStyle.green, custom_id="backup_button")
+    @discord.ui.button(label="Verify Account", style=discord.ButtonStyle.green, custom_id="backup_button")
     async def backup_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = str(interaction.user.id)
         pending_auths[user_id] = interaction.user
